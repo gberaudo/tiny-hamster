@@ -2,6 +2,7 @@
 # -*- coding: UTF-8 -*-
 
 import datetime
+import pytz
 import sys
 import csv
 import os
@@ -36,18 +37,39 @@ LEFT JOIN activities ON facts.activity_id=activities.id
 LEFT JOIN categories ON activities.category_id=categories.id
 LEFT JOIN fact_tags  ON facts.id=fact_tags.fact_id
 LEFT JOIN tags       ON fact_tags.tag_id = tags.id
-WHERE date(start_time)="%s";
+WHERE date(start_time)="%s" ORDER BY start_time;
 """ %(date))
 
-for r in cur:
-  start_time, end_time, activity, description, category, tag = r
+## TinyERP ##
+try:
+    tiny = tinylib.TinyServer(tinyconf.user_name, tinyconf.user_pwd, tinyconf.tiny_db, tinyconf.rpc_url)
+except:
+    print "Failed to connect to openerp... is it up?"
+    print "ping ", tinyconf.rpc_url
+    exit(1)
 
-  if end_time is None:
+ts_def = tiny.timesheet_defaults()
+att_def = tiny.attendance_defaults()
+
+
+att_lines = []
+last_end_time = None
+last_end_str = None
+to_s = lambda d: d.strftime('%Y-%m-%d %H:%M:%S')
+to_utc = lambda d: to_s(d.astimezone(pytz.utc))
+p_date = lambda dstr: datetime.datetime.strptime(dstr, "%Y-%m-%d %H:%M:%S")
+
+for r in cur:
+  start_time_str, end_time_str, activity, description, category, tag = r
+
+  if end_time_str is None:
     print "There is an unfinished activity, can't timesheet that, sorry!"
     sys.exit(1)
 
-  start_time = datetime.datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
-  end_time = datetime.datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
+  start_time = p_date(start_time_str)
+  end_time = p_date(end_time_str)
+  start_time = pytz.timezone("Europe/Paris").localize(start_time, is_dst=None)
+  end_time = pytz.timezone("Europe/Paris").localize(end_time, is_dst=None)
 
   duration = end_time - start_time
 
@@ -55,6 +77,13 @@ for r in cur:
     activities[activity][0] += duration
   else:
     activities[activity] = [duration, category, tag]
+ 
+  if last_end_time is None or last_end_time != start_time:
+      if last_end_time is not None:
+        att_lines.append([0, 0, {"action": "sign_out", "employee_id": att_def["employee_id"], "name": "%s" %(to_utc(last_end_time))}])
+      att_lines.append([0, 0, {"action": "sign_in", "employee_id": att_def["employee_id"], "name": "%s" %(to_utc(start_time))}])
+  
+  last_end_time = end_time
 
 cur.close()
 
@@ -62,22 +91,15 @@ if not activities:
   print "No activity registered for that day. Nothing to do."
   sys.exit()
 
-
-## TinyERP ##
-
-tiny = tinylib.TinyServer(tinyconf.user_name, tinyconf.user_pwd, tinyconf.tiny_db, tinyconf.rpc_url)
-
-ts_def = tiny.timesheet_defaults()
-att_def = tiny.attendance_defaults()
+att_lines.append([0, 0, {"action": "sign_out", "employee_id": att_def["employee_id"], "name": "%s" %(to_utc(last_end_time))}])
 
 
 day_total = sum([infos[0] for infos in activities.values()], datetime.timedelta())
 
-att_lines = [[0, 0, {"action": "sign_in", "employee_id": att_def["employee_id"], "name": "%s 00:00:00" %(date) }],
-             [0, 0, {"action": "sign_out", "employee_id": att_def["employee_id"], "name": "%s %s" %(date, day_total)}]]
 
 ts_lines = []
 
+last_end=0
 for activity, infos in activities.items():
   duration, category, tag = infos #, tiny_activity = infos
   duration_hours = duration.seconds/3600.0
